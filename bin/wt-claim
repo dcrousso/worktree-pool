@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+#
+# claim (or create) a pooled worktree for the current session and print its absolute path on stdout, so callers can do:
+#
+#     cd "$(wt-claim --repo ~/Developer/WebKit)"
+#
+# claiming prefers, in order:
+#   1. a worktree this session already owns (reused, and its heartbeat refreshed)
+#   2. any free or stale pooled worktree (its build cache is reused)
+#   3. a brand new worktree, created only when every existing one is busy
+#
+# with --branch REF the claimed worktree is checked out on REF, creating it from the base when it does not exist yet
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-claim [--repo PATH] [--base REF] [--branch REF] [--note TEXT] [--refresh]
+       wt-claim REF [--repo PATH] [--base REF] [--note TEXT] [--refresh]
+
+  REF           a bare argument is the branch to check out (shorthand for --branch REF)
+  --repo PATH   repository to claim a worktree for (default: the current repo)
+  --base REF    ref to reset the worktree to (default: the repo default branch)
+  --branch REF  check out REF in the claimed worktree, creating it from the base if needed
+  --note TEXT   short label stored in the lock and shown by wt-status
+  --refresh     only refresh an already owned worktree, never claim a new one
+EOF
+}
+
+REPO=""
+BASE=""
+NOTE=""
+REFRESH_ONLY=0
+WANT_BRANCH=""
+POS=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--repo)
+			[ $# -ge 2 ] || die "--repo needs a value"
+			REPO="$2"
+			shift 2
+			;;
+		--base)
+			[ $# -ge 2 ] || die "--base needs a value"
+			BASE="$2"
+			shift 2
+			;;
+		--branch)
+			[ $# -ge 2 ] || die "--branch needs a value"
+			WANT_BRANCH="$2"
+			shift 2
+			;;
+		--note)
+			[ $# -ge 2 ] || die "--note needs a value"
+			NOTE="$2"
+			shift 2
+			;;
+		--refresh)
+			REFRESH_ONLY=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown argument: $1"
+			;;
+		*)
+			[ -z "$POS" ] || die "unexpected extra argument: $1"
+			POS="$1"
+			shift
+			;;
+	esac
+done
+
+if [ -n "$POS" ]; then
+	[ -z "$WANT_BRANCH" ] || die "give a positional branch or --branch, not both"
+	WANT_BRANCH="$POS"
+fi
+
+REPO="${REPO:-$PWD}"
+[ -d "$REPO" ] || die "repo path not found: $REPO"
+REPO="$(resolve_repo "$REPO")"
+KEY="$(repo_key "$REPO")"
+[ -n "$BASE" ] || BASE="$(default_base "$REPO")"
+
+git -C "$REPO" rev-parse --verify --quiet "$BASE" >/dev/null \
+	|| die "base ref '$BASE' not found in $REPO"
+
+prepare_worktree() {
+	local wt="$1"
+	# never discard uncommitted work left in a worktree, even a stale one, so a crashed session's edits survive for manual recovery
+	if worktree_is_dirty "$wt"; then
+		log "skip $(basename "$wt") (uncommitted changes; wt remove --force to reclaim)"
+		return 1
+	fi
+	git -C "$wt" checkout --quiet --detach "$BASE" 2>/dev/null || return 1
+	git -C "$wt" reset --quiet --hard "$BASE" 2>/dev/null || return 1
+	# keep ignored build output (no `-x`) so the next build stays incremental
+	git -C "$wt" clean -qfd 2>/dev/null || true
+}
+
+# ensure_on_branch <wt> checks out WANT_BRANCH in <wt>, creating it from the current
+# HEAD when it does not exist yet, and a no-op when --branch was not given
+ensure_on_branch() {
+	local wt="$1" holder
+	[ -n "$WANT_BRANCH" ] || return 0
+	if [ "$(git -C "$wt" branch --show-current 2>/dev/null || true)" = "$WANT_BRANCH" ]; then
+		return 0
+	fi
+	if git -C "$wt" show-ref --verify --quiet "refs/heads/$WANT_BRANCH"; then
+		# a branch can be checked out in only one worktree at a time, so name the holder for a clear error
+		holder="$(git -C "$wt" worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$WANT_BRANCH" '/^worktree /{w=substr($0,10)} /^branch /{if ($2==b) print w}')"
+		if [ -n "$holder" ] && [ "$holder" != "$wt" ]; then
+			die "branch '$WANT_BRANCH' is already checked out in $(basename "$holder")"
+		fi
+		git -C "$wt" checkout --quiet "$WANT_BRANCH" 2>/dev/null \
+			|| die "cannot check out branch '$WANT_BRANCH' in $(basename "$wt")"
+	else
+		git -C "$wt" checkout --quiet -b "$WANT_BRANCH" 2>/dev/null \
+			|| die "cannot create branch '$WANT_BRANCH' in $(basename "$wt")"
+	fi
+}
+
+# 1. reuse a worktree this session already owns
+for lock in "$LOCK_DIR/$KEY"-*.lock; do
+	[ -e "$lock" ] || continue
+	[ "$(read_field "$lock" session)" = "$SESSION_ID" ] || continue
+	wt="$(read_field "$lock" worktree)"
+	if [ -d "$wt" ]; then
+		refresh_heartbeat "$lock"
+		ensure_on_branch "$wt"
+		log "reusing $(basename "$wt")"
+		printf '%s\n' "$wt"
+		exit 0
+	fi
+	rm -f "$lock"
+done
+
+[ "$REFRESH_ONLY" -eq 1 ] && die "no owned worktree to refresh for $KEY"
+
+# this session has no reusable worktree, so drop metadata for any worktree whose directory was deleted out from under git
+git -C "$REPO" worktree prune --expire now >/dev/null 2>&1 || true
+
+# 2. claim any free or stale pooled worktree, reusing its build cache
+for wt in "$POOL_ROOT/$KEY"-*; do
+	[ -d "$wt" ] || continue
+	name="$(basename "$wt")"
+	lock="$LOCK_DIR/$name.lock"
+	if [ -e "$lock" ]; then
+		if lock_is_stale "$lock"; then
+			log "reclaiming stale $name (owner $(short "$(read_field "$lock" session)"))"
+		else
+			continue
+		fi
+	fi
+	if with_lock "$lock.mx" claim_slot "$lock" "$REPO" "$wt" "detached:$BASE" "$NOTE"; then
+		if prepare_worktree "$wt"; then
+			ensure_on_branch "$wt"
+			log "claimed $name (reused build cache)"
+			printf '%s\n' "$wt"
+			exit 0
+		fi
+		rm -f "$lock"
+	fi
+done
+
+# 3. every worktree is busy, so create a new one
+# claim a candidate index's lock before `git worktree add` so two racing sessions cannot collide on the same index
+max=0
+for wt in "$POOL_ROOT/$KEY"-*; do
+	[ -d "$wt" ] || continue
+	n="${wt##*-}"
+	case "$n" in
+		''|*[!0-9]*) continue ;;
+	esac
+	[ "$n" -gt "$max" ] && max="$n"
+done
+
+idx=$(( max + 1 ))
+attempts=0
+while [ "$attempts" -lt 100 ]; do
+	attempts=$(( attempts + 1 ))
+	name="$KEY-$idx"
+	wt="$POOL_ROOT/$name"
+	lock="$LOCK_DIR/$name.lock"
+
+	if [ -e "$lock" ] && ! lock_is_stale "$lock"; then
+		idx=$(( idx + 1 ))
+		continue
+	fi
+	if ! with_lock "$lock.mx" claim_slot "$lock" "$REPO" "$wt" "detached:$BASE" "$NOTE"; then
+		idx=$(( idx + 1 ))
+		continue
+	fi
+
+	if [ -d "$wt" ] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+		if prepare_worktree "$wt"; then
+			ensure_on_branch "$wt"
+			log "claimed existing $name (reused build cache)"
+			printf '%s\n' "$wt"
+			exit 0
+		fi
+	elif [ ! -e "$wt" ] && git -C "$REPO" worktree add --quiet --detach "$wt" "$BASE" >/dev/null 2>&1; then
+		ensure_on_branch "$wt"
+		log "created $name (first build will be full)"
+		printf '%s\n' "$wt"
+		exit 0
+	fi
+
+	rm -f "$lock"
+	idx=$(( idx + 1 ))
+done
+
+die "unable to claim or create a pooled worktree after $attempts attempts"

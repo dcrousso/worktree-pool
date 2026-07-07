@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+#
+# return the worktree(s) this session owns to the pool
+#
+# releasing resets the worktree to a clean base and removes the lock, but keeps the build output so the next session that claims it builds incrementally
+# it never deletes the worktree
+#
+# by default it frees the worktrees this session owns
+# with --worktree NAME or --branch REF it frees one specific worktree regardless of which session owns it, so you can reclaim by hand a worktree whose session (for example an agent) has gone away
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-release [--repo PATH] [--base REF] [--all] [--force]
+       wt-release NAME|REF... [--base REF] [--force] [--delete-branch]
+       wt-release --worktree NAME|PATH [--branch REF] [--base REF] [--force]
+       wt-release --branch REF [--base REF] [--force]
+
+  NAME|REF           one or more bare arguments, each auto-detected as a pooled worktree
+                     name/path, a branch checked out in one, or `.` for the worktree you
+                     are in
+  --repo PATH        release the worktree for this repo (default: the current repo)
+  --base REF         reset released worktrees to REF (default: the repo default branch)
+  --all              release every worktree this session owns, across all repos
+  --worktree NAME    release this specific pooled worktree (a name like myrepo-1 or a
+                     path), whichever session owns it
+  --branch REF       release the pooled worktree that currently has REF checked out,
+                     whichever session owns it
+  --force            release even a worktree with uncommitted changes (discards them)
+  --delete-branch    also delete the branch that was checked out (never the base branch)
+
+A positional argument, or --worktree/--branch, lets you reclaim a worktree by hand,
+for example when the session that claimed it (such as an agent) has gone away.  They
+act regardless of which session owns the lock, and a worktree with uncommitted changes
+is kept unless you pass --force.
+
+With no target at all, a bare `wt-release` run from inside a pooled worktree releases
+that worktree (the same as passing `.`), regardless of which session owns it.  From
+anywhere else it releases the worktrees this session owns for the current repo.  Pass
+--repo to force the session scoped behavior even from inside a worktree.
+EOF
+}
+
+REPO=""
+BASE=""
+ALL=0
+FORCE=0
+DELETE_BRANCH=0
+WANT_BRANCH=""
+WANT_WT=""
+POS_LIST=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--repo)
+			[ $# -ge 2 ] || die "--repo needs a value"
+			REPO="$2"
+			shift 2
+			;;
+		--base)
+			[ $# -ge 2 ] || die "--base needs a value"
+			BASE="$2"
+			shift 2
+			;;
+		--all)
+			ALL=1
+			shift
+			;;
+		--force)
+			FORCE=1
+			shift
+			;;
+		--delete-branch)
+			DELETE_BRANCH=1
+			shift
+			;;
+		--branch)
+			[ $# -ge 2 ] || die "--branch needs a value"
+			WANT_BRANCH="$2"
+			shift 2
+			;;
+		--worktree)
+			[ $# -ge 2 ] || die "--worktree needs a value"
+			WANT_WT="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown argument: $1"
+			;;
+		*)
+			POS_LIST+=("$1")
+			shift
+			;;
+	esac
+done
+
+if [ "$ALL" -eq 1 ] && { [ "${#POS_LIST[@]}" -gt 0 ] || [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; }; then
+	die "--all cannot be combined with a specific target"
+fi
+
+# with no target and no repo scope given, default to the pooled worktree the current
+# directory is in, so a bare `wt release` from inside a worktree releases that worktree
+# (the same as `wt release .`) without having to name its branch or worktree
+if [ "$ALL" -eq 0 ] && [ "${#POS_LIST[@]}" -eq 0 ] && [ -z "$WANT_WT" ] && [ -z "$WANT_BRANCH" ] && [ -z "$REPO" ]; then
+	here="$(in_pool_worktree)"
+	if [ -n "$here" ]; then
+		POS_LIST=("$here")
+	fi
+fi
+
+# delete_released_branch <wt> <branch> <base> deletes <branch> when --delete-branch is
+# given and it is a real branch other than the base, called after the worktree detaches
+delete_released_branch() {
+	local wt="$1" branch="$2" base="$3"
+	[ "$DELETE_BRANCH" -eq 1 ] || return 0
+	[ -n "$branch" ] || return 0
+	[ "$branch" != "$base" ] || return 0
+	if git -C "$wt" branch -D "$branch" >/dev/null 2>&1; then
+		log "deleted branch $branch"
+	else
+		log "kept branch $branch (could not delete)"
+	fi
+}
+
+# release_target <wt> <lock> resets and frees one specific worktree regardless of
+# which session owns it, for the --worktree/--branch selectors
+# a worktree with uncommitted changes is kept unless --force is given
+# run this through `with_lock` so it cannot race a concurrent claim
+# shellcheck disable=SC2317  # invoked indirectly through with_lock
+release_target() {
+	local wt="$1" lock="$2" base curbranch
+	if [ -d "$wt" ]; then
+		if [ "$FORCE" -eq 0 ] && worktree_is_dirty "$wt"; then
+			log "kept $(basename "$wt"): uncommitted changes (use --force to discard)"
+			return 1
+		fi
+		# keep any lock fresh so the reset cannot be interrupted by a concurrent reclaim
+		if [ -f "$lock" ]; then
+			refresh_heartbeat "$lock"
+		fi
+		base="$BASE"
+		if [ -z "$base" ]; then
+			base="$(default_base "$wt")"
+		fi
+		curbranch="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+		if ! git -C "$wt" checkout --quiet --detach "$base" 2>/dev/null; then
+			log "kept $(basename "$wt"): base '$base' not found"
+			return 1
+		fi
+		git -C "$wt" reset --quiet --hard "$base" 2>/dev/null || true
+		git -C "$wt" clean -qfd 2>/dev/null || true
+		delete_released_branch "$wt" "$curbranch" "$base"
+		log "released $(basename "$wt") (build cache kept)"
+	fi
+	rm -f "$lock"
+	return 0
+}
+
+# with positional target(s), --worktree, and/or --branch, release those specific
+# worktrees, whichever session owns them (reclaim a departed agent's worktree by hand)
+if [ "${#POS_LIST[@]}" -gt 0 ] || [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+	targets=()
+	if [ "${#POS_LIST[@]}" -gt 0 ]; then
+		if [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+			die "give positional target(s) or --branch/--worktree, not both"
+		fi
+		for tok in "${POS_LIST[@]}"; do
+			t="$(resolve_target_token "$tok")" || exit 1
+			targets+=("$t")
+		done
+	else
+		t="$(resolve_target "$WANT_WT" "$WANT_BRANCH")" || exit 1
+		targets+=("$t")
+	fi
+	rc=0
+	for target in "${targets[@]}"; do
+		name="$(basename "$target")"
+		lock="$LOCK_DIR/$name.lock"
+		trc=0
+		with_lock "$lock.mx" release_target "$target" "$lock" || trc=$?
+		if [ "$trc" -eq "$WT_LOCK_BUSY" ]; then
+			log "kept $name: busy, try again"
+		fi
+		[ "$trc" -eq 0 ] || rc=1
+	done
+	exit "$rc"
+fi
+
+KEY=""
+if [ "$ALL" -eq 0 ]; then
+	REPO="${REPO:-$PWD}"
+	[ -d "$REPO" ] || die "repo path not found: $REPO"
+	REPO="$(resolve_repo "$REPO")"
+	KEY="$(repo_key "$REPO")"
+fi
+
+# release_one <lockfile> resets and frees a worktree this session still owns
+# run this through `with_lock` so it cannot race a concurrent reclaim
+# shellcheck disable=SC2317  # invoked indirectly through with_lock
+release_one() {
+	local lock="$1" wt base curbranch
+	[ "$(read_field "$lock" session)" = "$SESSION_ID" ] || return 1
+	wt="$(read_field "$lock" worktree)"
+	if [ -d "$wt" ]; then
+		if [ "$FORCE" -eq 0 ] && worktree_is_dirty "$wt"; then
+			log "kept $(basename "$wt"): uncommitted changes (use --force to discard)"
+			return 1
+		fi
+		# keep the lock fresh so it cannot be reclaimed while the reset runs, even if the reset outlives the mutex recovery window
+		refresh_heartbeat "$lock"
+		base="$BASE"
+		[ -n "$base" ] || base="$(default_base "$wt")"
+		curbranch="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+		if ! git -C "$wt" checkout --quiet --detach "$base" 2>/dev/null; then
+			log "kept $(basename "$wt"): base '$base' not found"
+			return 1
+		fi
+		git -C "$wt" reset --quiet --hard "$base" 2>/dev/null || true
+		git -C "$wt" clean -qfd 2>/dev/null || true
+		delete_released_branch "$wt" "$curbranch" "$base"
+		log "released $(basename "$wt") (build cache kept)"
+	fi
+	rm -f "$lock"
+	return 0
+}
+
+seen=0
+released=0
+stuck=0
+for lock in "$LOCK_DIR"/*.lock; do
+	[ -e "$lock" ] || continue
+	[ "$(read_field "$lock" session)" = "$SESSION_ID" ] || continue
+	if [ "$ALL" -eq 0 ]; then
+		case "$(basename "$lock" .lock)" in
+			"$KEY"-*) ;;
+			*) continue ;;
+		esac
+	fi
+	seen=$(( seen + 1 ))
+	rc=0
+	with_lock "$lock.mx" release_one "$lock" || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		released=$(( released + 1 ))
+	elif [ "$rc" -eq "$WT_LOCK_BUSY" ]; then
+		log "kept $(basename "$lock" .lock): busy, try again"
+		stuck=$(( stuck + 1 ))
+	fi
+done
+
+[ "$seen" -eq 0 ] && log "no worktrees owned by this session to release"
+[ "$stuck" -gt 0 ] && exit 1
+exit 0

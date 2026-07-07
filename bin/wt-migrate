@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# normalize legacy pooled worktree names to the current scheme
+#
+# an earlier `repo_key` folded the trailing newline from `basename` into a `_`, so worktrees were named `<repo>_-N` instead of `<repo>-N`
+# this renames each affected worktree that is free, stale, or owned by this session, updates its lock, and leaves any worktree that a live foreign session still holds
+# it is safe to run repeatedly
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-migrate [--dry-run]
+
+  --dry-run   report what would change without moving anything
+EOF
+}
+
+DRY=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--dry-run)
+			DRY=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown argument: $1"
+			;;
+	esac
+done
+
+migrated=0
+skipped=0
+for wt in "$POOL_ROOT"/*-*; do
+	[ -d "$wt" ] || continue
+	name="$(basename "$wt")"
+	idx="${name##*-}"
+	case "$idx" in
+		''|*[!0-9]*) continue ;;
+	esac
+
+	main="$(git -C "$wt" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || true
+	[ -n "$main" ] || continue
+	target="$(repo_key "$main")-$idx"
+	[ "$name" = "$target" ] && continue
+
+	dest="$POOL_ROOT/$target"
+	lock="$LOCK_DIR/$name.lock"
+
+	if [ -e "$dest" ]; then
+		log "skip $name ($target already exists)"
+		skipped=$(( skipped + 1 ))
+		continue
+	fi
+	if [ -e "$lock" ] \
+		&& [ "$(read_field "$lock" session)" != "$SESSION_ID" ] \
+		&& ! lock_is_stale "$lock"; then
+		log "skip $name (held by live session $(short "$(read_field "$lock" session)"))"
+		skipped=$(( skipped + 1 ))
+		continue
+	fi
+
+	if [ "$DRY" -eq 1 ]; then
+		log "would rename $name to $target"
+		continue
+	fi
+
+	moved=0
+	git -C "$main" worktree move "$wt" "$dest" >/dev/null 2>&1 && moved=1
+	if [ "$moved" -eq 0 ]; then
+		git -C "$wt" fsmonitor--daemon stop >/dev/null 2>&1 || true
+		git -C "$main" worktree move "$wt" "$dest" >/dev/null 2>&1 && moved=1
+	fi
+	if [ "$moved" -eq 0 ] && mv "$wt" "$dest" 2>/dev/null; then
+		if git -C "$main" worktree repair "$dest" >/dev/null 2>&1 && git -C "$dest" rev-parse --git-dir >/dev/null 2>&1; then
+			moved=1
+		else
+			mv "$dest" "$wt" 2>/dev/null || true
+		fi
+	fi
+	if [ "$moved" -eq 0 ]; then
+		log "error: could not move $name (left in place)"
+		skipped=$(( skipped + 1 ))
+		continue
+	fi
+
+	if [ -e "$lock" ]; then
+		newlock="$LOCK_DIR/$target.lock"
+		tmp="$(mktemp "${newlock}.XXXXXX")"
+		{
+			grep -v '^worktree=' "$lock" || true
+			printf 'worktree=%s\n' "$dest"
+		} > "$tmp"
+		mv -f "$tmp" "$newlock"
+		rm -f "$lock"
+	fi
+
+	log "renamed $name to $target"
+	migrated=$(( migrated + 1 ))
+done
+
+log "done ($migrated renamed, $skipped skipped)"

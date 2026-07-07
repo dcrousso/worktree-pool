@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# report (and optionally fix) inconsistencies that build up in a long lived pool:
+#   - orphaned locks whose worktree directory is gone
+#   - leftover mutex directories from a crashed claim or release
+#   - dangling worktrees that git no longer recognizes
+#
+# with --fix it removes orphaned locks and leftover mutexes and prunes git worktree
+# metadata, and it never deletes a worktree directory or a lock a live worktree still uses
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-doctor [--fix]
+
+  --fix   remove orphaned locks and leftover mutexes, and prune git worktree metadata
+EOF
+}
+
+FIX=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--fix)
+			FIX=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown argument: $1"
+			;;
+	esac
+done
+
+issues=0
+fixed=0
+prune_repos=()
+
+# 1. orphaned locks: the recorded worktree directory no longer exists
+for lock in "$LOCK_DIR"/*.lock; do
+	[ -e "$lock" ] || continue
+	wt="$(read_field "$lock" worktree)"
+	if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+		issues=$(( issues + 1 ))
+		repo="$(read_field "$lock" repo)"
+		[ -n "$repo" ] && prune_repos+=("$repo")
+		if [ "$FIX" -eq 1 ]; then
+			rm -f "$lock"
+			log "removed orphaned lock $(basename "$lock" .lock)"
+			fixed=$(( fixed + 1 ))
+		else
+			log "orphaned lock: $(basename "$lock" .lock) (worktree ${wt:-<none>} is gone)"
+		fi
+	fi
+done
+
+# 2. leftover mutexes from a crashed critical section
+for mx in "$LOCK_DIR"/*.lock.mx; do
+	[ -d "$mx" ] || continue
+	issues=$(( issues + 1 ))
+	if [ "$FIX" -eq 1 ]; then
+		rm -rf "$mx"
+		log "removed leftover mutex $(basename "$mx")"
+		fixed=$(( fixed + 1 ))
+	else
+		log "leftover mutex: $(basename "$mx")"
+	fi
+done
+
+# 3. dangling worktrees: a pooled directory git no longer tracks as a worktree
+for wt in "$POOL_ROOT"/*-*; do
+	[ -d "$wt" ] || continue
+	case "${wt##*-}" in
+		''|*[!0-9]*) continue ;;
+	esac
+	if [ -e "$wt/.git" ] && ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+		issues=$(( issues + 1 ))
+		log "dangling worktree: $(basename "$wt") (git does not recognize it; 'wt remove --force $(basename "$wt")' to delete)"
+	fi
+done
+
+# 4. prune git metadata for the repos whose worktrees were removed
+if [ "$FIX" -eq 1 ] && [ "${#prune_repos[@]}" -gt 0 ]; then
+	printf '%s\n' "${prune_repos[@]}" | sort -u | while IFS= read -r repo; do
+		[ -d "$repo" ] || continue
+		git -C "$repo" worktree prune >/dev/null 2>&1 || true
+	done
+fi
+
+if [ "$issues" -eq 0 ]; then
+	log "pool is healthy"
+	exit 0
+fi
+
+remaining=$(( issues - fixed ))
+log "$issues issue(s) found, $fixed fixed, $remaining remaining"
+if [ "$remaining" -eq 0 ]; then
+	exit 0
+fi
+exit 1

@@ -1,0 +1,7 @@
+*.swo
+*.swp
+*~
+._*
+.DS_Store
+/build.lock
+/locks/

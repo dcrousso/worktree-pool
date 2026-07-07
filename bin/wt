@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# entry point for the worktree pool
+# it dispatches to the `wt-<command>` scripts so `wt claim` runs `wt-claim`, `wt status` runs `wt-status`, etc.
+
+set -euo pipefail
+
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt <command> [options]
+
+  claim     claim (or create) a pooled worktree and print its path (a REF arg checks it out)
+  release   return worktree(s) to the pool: this session's, the one you are in, or one you name
+  build     run a build under the machine wide build lock (name a worktree/branch to pick it)
+  status    show the state of the pool
+  migrate   normalize legacy worktree names to the current scheme
+  remove    delete pooled worktrees to reclaim disk (name a worktree/branch to pick one)
+  path      print a pooled worktree's path with no side effects (the one you are in, name/branch, or owned)
+  doctor    report (with --fix, clean up) orphaned locks, leftover mutexes, and dangling worktrees
+
+Run `wt <command> --help` for the options of a command.
+EOF
+}
+
+sub="${1:-help}"
+if [ $# -gt 0 ]; then
+	shift
+fi
+
+case "$sub" in
+	claim|release|build|status|migrate|remove|path|doctor)
+		exec "$BIN/wt-$sub" "$@"
+		;;
+	help|-h|--help)
+		usage
+		exit 0
+		;;
+	*)
+		printf '[wt] error: unknown command: %s\n' "$sub" >&2
+		usage
+		exit 1
+		;;
+esac

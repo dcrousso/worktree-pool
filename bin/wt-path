@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# print the path of a pooled worktree, with no side effects (no claim, no reset, no lock change)
+#
+# with a positional NAME|REF (or --worktree/--branch) it resolves that specific worktree
+# with no target it prints the worktree this session owns for the repo
+#
+# handy for cd:
+#     cd "$(wt path pr-68663-slotted)"
+# or a shell helper (a subprocess cannot cd the parent shell):
+#     wtcd() { cd "$(wt path "$@")"; }
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-path [NAME|REF]
+       wt-path [--worktree NAME|PATH] [--branch REF]
+       wt-path [--repo PATH]
+
+  NAME|REF           a bare argument is auto-detected as a pooled worktree name/path
+                     or a branch checked out in a pooled worktree
+  --worktree NAME    print this specific pooled worktree
+  --branch REF       print the pooled worktree that currently has REF checked out
+  --repo PATH        with no target, the repo whose owned worktree to print (default: cwd)
+
+With no target, prints the pooled worktree the current directory is in, or else the
+worktree this session owns for the repo.
+EOF
+}
+
+REPO=""
+WANT_BRANCH=""
+WANT_WT=""
+POS=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--repo)
+			[ $# -ge 2 ] || die "--repo needs a value"
+			REPO="$2"
+			shift 2
+			;;
+		--branch)
+			[ $# -ge 2 ] || die "--branch needs a value"
+			WANT_BRANCH="$2"
+			shift 2
+			;;
+		--worktree)
+			[ $# -ge 2 ] || die "--worktree needs a value"
+			WANT_WT="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown argument: $1"
+			;;
+		*)
+			[ -z "$POS" ] || die "unexpected extra argument: $1"
+			POS="$1"
+			shift
+			;;
+	esac
+done
+
+# a specific target: auto-detected positional, or --worktree/--branch
+if [ -n "$POS" ] || [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+	select_target "$POS" "$WANT_WT" "$WANT_BRANCH" || exit 1
+	exit 0
+fi
+
+# no target and no repo scope: if the current directory is inside a pooled worktree,
+# print that worktree, so a bare `wt path` from within a worktree resolves it without
+# having to name it
+if [ -z "$REPO" ]; then
+	here="$(in_pool_worktree)"
+	if [ -n "$here" ]; then
+		printf '%s\n' "$here"
+		exit 0
+	fi
+fi
+
+# no target: print the worktree this session owns for the repo
+REPO="${REPO:-$PWD}"
+[ -d "$REPO" ] || die "repo path not found: $REPO"
+REPO="$(resolve_repo "$REPO")"
+KEY="$(repo_key "$REPO")"
+for lock in "$LOCK_DIR/$KEY"-*.lock; do
+	[ -e "$lock" ] || continue
+	[ "$(read_field "$lock" session)" = "$SESSION_ID" ] || continue
+	wt="$(read_field "$lock" worktree)"
+	if [ -d "$wt" ]; then
+		printf '%s\n' "$wt"
+		exit 0
+	fi
+done
+die "this session owns no worktree for $(basename "$REPO")"

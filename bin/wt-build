@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# run a build command under a machine wide lock so that only one heavy build runs at a time across every pooled worktree
+#
+# concurrent WebKit builds already saturate the CPU and share Xcode's compilation cache, so running several at once just thrashes CPU and IO and makes them all slower
+# serializing keeps each build fast
+#
+#     wt-build -- Tools/Scripts/build-webkit --release
+#     wt-build -- npm run build
+#     wt-build --branch my-feature -- npm run build
+#
+# the command runs in the current directory, or, with --worktree NAME or --branch REF, in that specific pooled worktree
+# when the chosen directory belongs to a worktree this session owns, its heartbeat is refreshed first so a long build is never mistaken for a dead session
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-build [NAME|REF] -- <command...>
+       wt-build [--worktree NAME|PATH | --branch REF] -- <command...>
+
+  NAME|REF           a bare argument is auto-detected as a pooled worktree name/path
+                     or, failing that, a branch checked out in a pooled worktree
+  --worktree NAME    run the command in this specific pooled worktree
+  --branch REF       run the command in the pooled worktree that has REF checked out
+  --                 everything after this is the command to run
+
+Without a target the command runs in the current directory.
+EOF
+}
+
+WANT_BRANCH=""
+WANT_WT=""
+POS=""
+CMD=()
+seen=0
+while [ $# -gt 0 ]; do
+	if [ "$seen" -eq 1 ]; then
+		CMD+=("$1")
+		shift
+		continue
+	fi
+	case "$1" in
+		--)
+			seen=1
+			shift
+			;;
+		--branch)
+			[ $# -ge 2 ] || die "--branch needs a value"
+			WANT_BRANCH="$2"
+			shift 2
+			;;
+		--worktree)
+			[ $# -ge 2 ] || die "--worktree needs a value"
+			WANT_WT="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown argument: $1 (put the command after --)"
+			;;
+		*)
+			[ -z "$POS" ] || die "unexpected extra argument '$1' before -- (did you forget --?)"
+			POS="$1"
+			shift
+			;;
+	esac
+done
+[ "${#CMD[@]}" -gt 0 ] || die "usage: wt-build [NAME|REF] -- <command...>"
+command -v python3 >/dev/null 2>&1 || die "python3 is required for the global build lock"
+
+# with a positional target, --worktree, or --branch, run the build in that worktree instead of the current directory
+if [ -n "$POS" ] || [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+	target="$(select_target "$POS" "$WANT_WT" "$WANT_BRANCH")" || exit 1
+	cd "$target" || die "cannot cd into $(basename "$target")"
+fi
+
+own_lock=""
+for lock in "$LOCK_DIR"/*.lock; do
+	[ -e "$lock" ] || continue
+	[ "$(read_field "$lock" session)" = "$SESSION_ID" ] || continue
+	wt="$(read_field "$lock" worktree)"
+	[ -n "$wt" ] || continue
+	case "$PWD/" in
+		"$wt"/*)
+			own_lock="$lock"
+			refresh_heartbeat "$lock"
+			break
+			;;
+	esac
+done
+
+# serialize on a global advisory lock
+# `flock(1)` is not available on macOS, so this acquires an `fcntl` lock through python
+# the owning worktree's heartbeat is kept fresh across the wait and the build so a long build is never reclaimed as stale
+exec python3 - "$BUILD_LOCK" "$own_lock" "$SESSION_ID" "${CMD[@]}" <<'PY'
+import fcntl, os, signal, subprocess, sys, threading, time
+
+build_lock, hb_lock, hb_session, *cmd = sys.argv[1:]
+
+stop = threading.Event()
+
+def keep_alive():
+    want = "session=%s\n" % hb_session
+    while not stop.wait(60):
+        try:
+            with open(hb_lock) as f:
+                body = f.read()
+        except OSError:
+            continue
+        if not body.startswith(want):
+            continue
+        lines = [ln for ln in body.splitlines(keepends=True) if not ln.startswith("heartbeat=")]
+        lines.append("heartbeat=%d\n" % int(time.time()))
+        tmp = "%s.hb.%d" % (hb_lock, os.getpid())
+        try:
+            with open(tmp, "w") as f:
+                f.writelines(lines)
+            os.replace(tmp, hb_lock)
+        except OSError:
+            pass
+
+if hb_lock:
+    threading.Thread(target=keep_alive, daemon=True).start()
+
+fd = os.open(build_lock, os.O_CREAT | os.O_RDWR, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.stderr.write("[wt] waiting for the global build slot (another build is running)\n")
+    sys.stderr.flush()
+    t0 = time.time()
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    sys.stderr.write("[wt] build slot acquired after %ds\n" % int(time.time() - t0))
+    sys.stderr.flush()
+
+os.ftruncate(fd, 0)
+os.write(fd, ("pid=%d started=%d\n" % (os.getpid(), int(time.time()))).encode())
+os.fsync(fd)
+
+# hold the lock until the build itself finishes, forwarding signals so a cancel stops the build rather than orphaning it
+proc = subprocess.Popen(cmd)
+
+def forward(signum, frame):
+    try:
+        proc.send_signal(signum)
+    except Exception:
+        pass
+
+signal.signal(signal.SIGTERM, forward)
+signal.signal(signal.SIGINT, forward)
+
+rc = proc.wait()
+stop.set()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY

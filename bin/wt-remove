@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+#
+# remove pooled worktrees to reclaim disk
+#
+# this deletes a worktree along with its build cache, so it is the opposite of `wt-release` (which keeps the cache)
+# only free or stale worktrees are removed, a worktree held by a live session or holding uncommitted changes is kept unless `--force` is given
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-remove [--repo PATH] [--all] [--force] [--dry-run]
+       wt-remove NAME|REF... [--force] [--dry-run]
+       wt-remove --worktree NAME|PATH [--branch REF] [--force] [--dry-run]
+       wt-remove --branch REF [--force] [--dry-run]
+
+  NAME|REF           one or more bare arguments, each auto-detected as a pooled worktree
+                     name/path, a branch checked out in one, or `.` for the worktree you
+                     are in
+  --repo PATH        remove pooled worktrees for this repo (default: the current repo)
+  --all              consider every repo's pooled worktrees
+  --worktree NAME    remove this specific pooled worktree (a name like myrepo-1 or a
+                     path), whichever session owns it
+  --branch REF       remove the pooled worktree that currently has REF checked out,
+                     whichever session owns it
+  --force            also remove worktrees held by a live session or with uncommitted changes
+  --dry-run          report what would be removed without removing anything
+EOF
+}
+
+REPO=""
+ALL=0
+FORCE=0
+DRY=0
+WANT_BRANCH=""
+WANT_WT=""
+POS_LIST=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--repo)
+			[ $# -ge 2 ] || die "--repo needs a value"
+			REPO="$2"
+			shift 2
+			;;
+		--all)
+			ALL=1
+			shift
+			;;
+		--force)
+			FORCE=1
+			shift
+			;;
+		--dry-run)
+			DRY=1
+			shift
+			;;
+		--branch)
+			[ $# -ge 2 ] || die "--branch needs a value"
+			WANT_BRANCH="$2"
+			shift 2
+			;;
+		--worktree)
+			[ $# -ge 2 ] || die "--worktree needs a value"
+			WANT_WT="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-*)
+			die "unknown argument: $1"
+			;;
+		*)
+			POS_LIST+=("$1")
+			shift
+			;;
+	esac
+done
+
+EXPLICIT=0
+if [ "${#POS_LIST[@]}" -gt 0 ] || [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+	EXPLICIT=1
+fi
+
+if [ "$EXPLICIT" -eq 1 ] && [ "$ALL" -eq 1 ]; then
+	die "--all cannot be combined with a specific target"
+fi
+
+KEY=""
+if [ "$ALL" -eq 0 ] && [ "$EXPLICIT" -eq 0 ]; then
+	REPO="${REPO:-$PWD}"
+	[ -d "$REPO" ] || die "repo path not found: $REPO"
+	REPO="$(resolve_repo "$REPO")"
+	KEY="$(repo_key "$REPO")"
+fi
+
+# remove_one <worktree> <lockfile> deletes a worktree and its lock
+# run this through `with_lock` and it re-checks ownership so a worktree a live session just claimed is not deleted
+# take_for_removal <lockfile> <worktree> takes exclusive ownership of a worktree
+# that is safe to delete, re-checking liveness and dirtiness under the mutex
+# run this through `with_lock`
+# shellcheck disable=SC2317  # invoked indirectly through with_lock
+take_for_removal() {
+	local lock="$1" wt="$2"
+	if [ -e "$lock" ] && ! lock_is_stale "$lock" && [ "$FORCE" -eq 0 ]; then
+		return 1
+	fi
+	if [ "$FORCE" -eq 0 ] && worktree_is_dirty "$wt"; then
+		return 1
+	fi
+	[ -e "$lock" ] && rm -f "$lock"
+	acquire "$lock" removed "$wt" removing wt-remove
+}
+
+# delete_worktree <worktree> deletes a worktree and its git metadata
+# the caller holds the lock, so this runs outside the mutex and a slow delete cannot be interrupted by mutex recovery
+delete_worktree() {
+	local wt="$1" main
+	main="$(git -C "$wt" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || main=""
+	if [ -n "$main" ] && git -C "$main" worktree remove --force "$wt" >/dev/null 2>&1; then
+		return 0
+	fi
+	# only fall back to a raw delete when git no longer recognizes it as a worktree, so a git refusal is surfaced rather than bypassed
+	# require the `.git` marker so a plain directory that merely matches the naming is never deleted
+	if [ -e "$wt/.git" ] && { [ -z "$main" ] || ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; }; then
+		rm -rf "$wt" 2>/dev/null || return 1
+		if [ -n "$main" ]; then
+			git -C "$main" worktree prune >/dev/null 2>&1 || true
+		fi
+		return 0
+	fi
+	return 1
+}
+
+# remove_target <worktree-path> removes one specific worktree regardless of owner
+# it logs and returns nonzero (rather than exiting) so a batch can continue
+remove_target() {
+	local target="$1" name lock trc
+	name="$(basename "$target")"
+	lock="$LOCK_DIR/$name.lock"
+
+	case "$PWD/" in
+		"$target"/*)
+			if [ "$FORCE" -eq 0 ]; then
+				log "kept $name: the current directory (cd elsewhere, or use --force)"
+				return 1
+			fi
+			;;
+	esac
+	if [ -e "$lock" ] && ! lock_is_stale "$lock" && [ "$FORCE" -eq 0 ]; then
+		log "kept $name: held by live session $(short "$(read_field "$lock" session)") (use --force)"
+		return 1
+	fi
+	if [ "$FORCE" -eq 0 ] && worktree_is_dirty "$target"; then
+		log "kept $name: uncommitted changes (use --force)"
+		return 1
+	fi
+	if [ "$DRY" -eq 1 ]; then
+		log "would remove $name"
+		return 0
+	fi
+
+	trc=0
+	with_lock "$lock.mx" take_for_removal "$lock" "$target" || trc=$?
+	if [ "$trc" -eq "$WT_LOCK_BUSY" ]; then
+		log "kept $name: busy, try again"
+		return 1
+	fi
+	if [ "$trc" -ne 0 ]; then
+		log "kept $name: in use (use --force)"
+		return 1
+	fi
+	if delete_worktree "$target"; then
+		rm -f "$lock"
+		log "removed $name"
+		return 0
+	fi
+	rm -f "$lock"
+	log "kept $name: git would not remove it"
+	return 1
+}
+
+# with positional target(s), --worktree, and/or --branch, remove those specific worktrees, whichever session owns them
+if [ "$EXPLICIT" -eq 1 ]; then
+	targets=()
+	if [ "${#POS_LIST[@]}" -gt 0 ]; then
+		if [ -n "$WANT_WT" ] || [ -n "$WANT_BRANCH" ]; then
+			die "give positional target(s) or --branch/--worktree, not both"
+		fi
+		for tok in "${POS_LIST[@]}"; do
+			t="$(resolve_target_token "$tok")" || exit 1
+			targets+=("$t")
+		done
+	else
+		t="$(resolve_target "$WANT_WT" "$WANT_BRANCH")" || exit 1
+		targets+=("$t")
+	fi
+	rc=0
+	for target in "${targets[@]}"; do
+		remove_target "$target" || rc=1
+	done
+	exit "$rc"
+fi
+
+removed=0
+kept=0
+for wt in "$POOL_ROOT"/*-*; do
+	[ -d "$wt" ] || continue
+	name="$(basename "$wt")"
+	# only touch worktrees that match the pool's `<repo>-<N>` naming, never an unrelated directory that happens to contain `-`
+	case "${name##*-}" in
+		''|*[!0-9]*) continue ;;
+	esac
+	lock="$LOCK_DIR/$name.lock"
+	if [ "$ALL" -eq 0 ]; then
+		case "$name" in
+			"$KEY"-*) ;;
+			*) continue ;;
+		esac
+	fi
+
+	case "$PWD/" in
+		"$wt"/*)
+			if [ "$FORCE" -eq 0 ]; then
+				log "keep $name (the current directory)"
+				kept=$(( kept + 1 ))
+				continue
+			fi
+			;;
+	esac
+	if [ -e "$lock" ] && ! lock_is_stale "$lock" && [ "$FORCE" -eq 0 ]; then
+		log "keep $name (held by live session $(short "$(read_field "$lock" session)"))"
+		kept=$(( kept + 1 ))
+		continue
+	fi
+	if [ "$FORCE" -eq 0 ] && worktree_is_dirty "$wt"; then
+		log "keep $name (uncommitted changes; use --force)"
+		kept=$(( kept + 1 ))
+		continue
+	fi
+	if [ "$DRY" -eq 1 ]; then
+		log "would remove $name"
+		continue
+	fi
+
+	if ! with_lock "$lock.mx" take_for_removal "$lock" "$wt"; then
+		log "keep $name (in use)"
+		kept=$(( kept + 1 ))
+		continue
+	fi
+	if delete_worktree "$wt"; then
+		rm -f "$lock"
+		log "removed $name"
+		removed=$(( removed + 1 ))
+	else
+		rm -f "$lock"
+		log "keep $name (git would not remove it)"
+		kept=$(( kept + 1 ))
+	fi
+done
+
+log "done ($removed removed, $kept kept)"

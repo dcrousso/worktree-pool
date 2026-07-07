@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+#
+# show the state of the worktree pool: each worktree, its owner, how long it has been idle, whether it carries a warm build cache, and the global build lock
+
+# shellcheck source=wt-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wt-lib.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: wt-status [--disk] [--mine] [--porcelain] [--repo PATH]
+
+  --disk        include each worktree's disk usage (slower, runs du)
+  --mine        only show worktrees this session owns
+  --repo PATH   only show worktrees for this repo
+  --porcelain   machine readable: one tab-separated line per worktree
+                (name, session, branch, idle-seconds, build, path), no header
+EOF
+}
+
+DISK=0
+MINE=0
+PORCELAIN=0
+REPO=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--disk)
+			DISK=1
+			shift
+			;;
+		--mine)
+			MINE=1
+			shift
+			;;
+		--porcelain)
+			PORCELAIN=1
+			shift
+			;;
+		--repo)
+			[ $# -ge 2 ] || die "--repo needs a value"
+			REPO="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown argument: $1"
+			;;
+	esac
+done
+
+dir_size() { du -sh "$1" 2>/dev/null | cut -f1; }
+
+# directories that signal a warm build cache
+# override with `WT_BUILD_DIRS`, a colon separated list of paths relative to a worktree
+BUILD_DIRS="${WT_BUILD_DIRS:-WebKitBuild:out:build:target:dist:node_modules}"
+
+build_state() {
+	local wt="$1" rel
+	if [ -d "$wt/WebKitBuild/Release" ]; then
+		printf 'release'
+		return
+	fi
+	if [ -d "$wt/WebKitBuild/Debug" ]; then
+		printf 'debug'
+		return
+	fi
+	local IFS=:
+	for rel in $BUILD_DIRS; do
+		if [ -d "$wt/$rel" ]; then
+			printf 'yes'
+			return
+		fi
+	done
+	printf 'no'
+}
+
+build_lock_held() {
+	[ -e "$BUILD_LOCK" ] || return 1
+	python3 - "$BUILD_LOCK" 2>/dev/null <<'PY'
+import fcntl, sys
+fd = open(sys.argv[1])
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    sys.exit(1)
+except OSError:
+    sys.exit(0)
+PY
+}
+
+# the worktrees to show, optionally scoped to one repo with --repo
+KEY=""
+if [ -n "$REPO" ]; then
+	[ -d "$REPO" ] || die "repo path not found: $REPO"
+	REPO="$(resolve_repo "$REPO")"
+	KEY="$(repo_key "$REPO")"
+fi
+if [ -n "$KEY" ]; then
+	worktrees=("$POOL_ROOT/$KEY"-*)
+else
+	worktrees=("$POOL_ROOT"/*-*)
+fi
+
+# --porcelain: one tab-separated line per worktree, no header, legend, or build lock
+# fields: name  session  branch  idle_seconds  build  path
+if [ "$PORCELAIN" -eq 1 ]; then
+	if [ "${#worktrees[@]}" -gt 0 ]; then
+		for wt in "${worktrees[@]}"; do
+			[ -d "$wt" ] || continue
+			name="$(basename "$wt")"
+			lock="$LOCK_DIR/$name.lock"
+			if [ -e "$lock" ]; then
+				session="$(read_field "$lock" session)"
+			else
+				session=""
+			fi
+			if [ "$MINE" -eq 1 ] && [ "$session" != "$SESSION_ID" ]; then
+				continue
+			fi
+			if [ -n "$session" ]; then
+				hb="$(read_field "$lock" heartbeat)"
+				case "$hb" in
+					''|*[!0-9]*) age="-" ;;
+					*) age=$(( $(now) - hb )) ;;
+				esac
+			else
+				session="-"
+				age="-"
+			fi
+			branch="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+			[ -n "$branch" ] || branch="-"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$session" "$branch" "$age" "$(build_state "$wt")" "$wt"
+		done
+	fi
+	exit 0
+fi
+
+printf 'Worktree pool: %s\n' "$POOL_ROOT"
+printf 'This session:  %s\n\n' "$(short "$SESSION_ID")"
+
+total=0
+mine=0
+free=0
+if [ "${#worktrees[@]}" -eq 0 ]; then
+	printf '  (no pooled worktrees%s)\n' "${KEY:+ for $KEY}"
+else
+	if [ "$DISK" -eq 1 ]; then
+		printf '  %-26s %-11s %-5s %-8s %-22s %-7s %s\n' WORKTREE OWNER AGE BUILD BRANCH SIZE NOTE
+	else
+		printf '  %-26s %-11s %-5s %-8s %-22s %s\n' WORKTREE OWNER AGE BUILD BRANCH NOTE
+	fi
+	for wt in "${worktrees[@]}"; do
+		[ -d "$wt" ] || continue
+		name="$(basename "$wt")"
+		lock="$LOCK_DIR/$name.lock"
+		if [ -e "$lock" ]; then
+			session="$(read_field "$lock" session)"
+		else
+			session=""
+		fi
+		if [ "$MINE" -eq 1 ] && [ "$session" != "$SESSION_ID" ]; then
+			continue
+		fi
+		total=$(( total + 1 ))
+		if [ -n "$session" ]; then
+			owner="$(short "$session")"
+			lock_is_stale "$lock" && owner="$owner*"
+			if [ "$session" = "$SESSION_ID" ]; then
+				owner="$owner(me)"
+				mine=$(( mine + 1 ))
+			fi
+			age="$(human_age "$(read_field "$lock" heartbeat)")"
+			note="$(read_field "$lock" note)"
+		else
+			owner="free"
+			age="-"
+			note=""
+			free=$(( free + 1 ))
+		fi
+		branch="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+		[ -n "$branch" ] || branch="-"
+		prefix="  "
+		case "$PWD/" in
+			"$wt"/*) prefix="> " ;;
+		esac
+		if [ "$DISK" -eq 1 ]; then
+			printf '%s%-26s %-11s %-5s %-8s %-22s %-7s %s\n' "$prefix" "$name" "$owner" "$age" "$(build_state "$wt")" "$branch" "$(dir_size "$wt")" "$note"
+		else
+			printf '%s%-26s %-11s %-5s %-8s %-22s %s\n' "$prefix" "$name" "$owner" "$age" "$(build_state "$wt")" "$branch" "$note"
+		fi
+	done
+	printf '\n%d worktree(s), %d yours, %d free\n' "$total" "$mine" "$free"
+fi
+
+printf '\nGlobal build lock: '
+if build_lock_held; then
+	printf 'held (a build is running)\n'
+else
+	printf 'free\n'
+fi
+
+printf '\n> marks the worktree you are in.  OWNER: a trailing * means stale (reclaimable), (me) means this session.  Stale after %sh idle.\n' "$STALE_HOURS"
